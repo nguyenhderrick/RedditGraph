@@ -1,0 +1,242 @@
+library('MASS')
+library('igraph')
+library('tidyverse')
+library('markovchain')
+library('SANTA')
+library('caret')
+
+
+reddit <- read.csv('/Reddit Edges (retrieved 5_21_16) (by @minimaxir) - results-20160521-121204.csv')
+author_count <- read.csv("/results-20190208-150952 - results-20190208-150952.csv")
+
+reddit_net <- graph.data.frame(reddit, directed=F)
+reddit_mat <- as_adjacency_matrix(reddit_net, attr='Weight')
+
+del_idx <- !(rownames(reddit_mat) %in% author_count$l_subreddit)
+reddit_mat <- reddit_mat[!del_idx, !del_idx]
+del_idx2 <- which(apply(reddit_mat, 1, sum) == 0)
+reddit_mat <- reddit_mat[-del_idx2, -del_idx2]
+
+name_orderer <- function (dist_graph, return.index = FALSE) {
+  ordered_dist <- order(dist_graph, decreasing=TRUE)
+  ordered_dist  <- matrix(c(((ordered_dist - 1) %% nrow(dist_graph)) + 1, 
+                            ordered_dist %/% nrow(dist_graph) + 1),
+                          nrow = prod(dim(dist_graph)), 
+                          ncol = 2)
+  
+  ordered_names <- matrix(NA,nrow(ordered_dist),2)
+  ordered_names[,1] <- rownames(dist_graph)[ordered_dist[,1]]
+  ordered_names[,2] <- rownames(dist_graph)[ordered_dist[,2]]
+  
+  if(return.index) {
+    list(ordered_names, ordered_dist)
+  } else {
+    ordered_names
+  }
+}
+
+## method mean first passage time
+mfpt_net <- graph_from_adjacency_matrix(reddit_mat, mode=c("directed"))
+mfpt_graph <- DistGraph(mfpt_net, 
+                          v=V(mfpt_net), 
+                          dist.method=c("mfpt"),
+                          correct.inf=FALSE, 
+                          correct.factor=-1, 
+                          verbose=TRUE)
+
+mfpt_ordered_names <- name_orderer(mfpt_graph)
+mfpt_paths <- apply(head(mfpt_ordered_names), 
+                    1, 
+                    function(x) shortest_paths(mfpt_net, 
+                                               x[1], 
+                                               x[2])$vpath[[1]])
+
+## method log mean first passage time
+reddit_log <- log(reddit_mat)
+reddit_log[reddit_log == -Inf] <- 0
+# multiplication because adjacency matrix expects whole numbers.
+reddit_log <- as.matrix(reddit_log) * 100
+reddit_log_net <- graph_from_adjacency_matrix(reddit_log, mode=c("directed"))
+log_graph <- DistGraph(reddit_log_net, 
+                          v=V(reddit_log_net), 
+                          dist.method=c("mfpt"),
+                          correct.inf=TRUE, 
+                          correct.factor=-1, 
+                          verbose=TRUE)
+mfpt_log_names <- name_orderer(log_graph)
+mfpt_log_paths <- apply(head(mfpt_log_names), 
+                        1, 
+                        function(x) shortest_paths(reddit_log_net, 
+                                                   x[1], 
+                                                   x[2])$vpath[[1]])
+
+## method shortest path
+reddit_inv <- reddit_mat ^ -1
+reddit_inv[is.infinite(reddit_inv)] <- 0
+
+reddit_trans_net <- graph_from_adjacency_matrix(as.matrix(reddit_inv), 
+                                                mode=c("directed"), 
+                                                weighted=TRUE)
+
+sp_graph <- DistGraph(reddit_trans_net, 
+                      v=V(reddit_trans_net), 
+                      edge.attr="weight", 
+                      dist.method=c("shortest.paths"),
+                      correct.inf=TRUE, 
+                      correct.factor=-1, 
+                      verbose=TRUE)
+
+sp_names <- name_orderer(sp_graph)
+
+shortest_paths(reddit_trans_net, sp_names[1,1], sp_names[1,2])
+
+##method log shortest paths
+w_reddit_inv <- log(reddit_mat) ^ -1
+w_reddit_inv[is.infinite(w_reddit_inv)] <- 0
+
+w_reddit_trans_net <- graph_from_adjacency_matrix(as.matrix(w_reddit_inv), 
+                                                  mode=c("directed"), 
+                                                  weighted=TRUE)
+
+wsp_graph <- DistGraph(w_reddit_trans_net, 
+                       v=V(w_reddit_trans_net), 
+                       edge.attr="weight", 
+                       dist.method=c("shortest.paths"),
+                       correct.inf=TRUE, 
+                       correct.factor=-1, 
+                       verbose=TRUE)
+
+wsp_names <- name_orderer(wsp_graph)
+
+shortest_paths(reddit_trans_net, wsp_names[1,1], wsp_names[1,2])
+
+
+sub_weight <- author_count[match(rownames(reddit_mat),author_count$l_subreddit),]
+rownames(sub_weight) <- sub_weight$l_subreddit
+sub_weight <- sub_weight["authors"]
+
+m_dt <- merge(as.data.frame(apply(reddit_mat, 1, sum)), 
+              sub_weight, 
+              by="row.names")
+names(m_dt) <- c("subreddit", "sum.auth", "tot.auth")
+m_dt["sum.auth/tot.auth"] <- m_dt["sum.auth"]/m_dt["tot.auth"]
+m_dt <- m_dt[match(rownames(reddit_mat), m_dt$subreddit),]
+m_dt$subreddit <- as.factor(m_dt$subreddit)
+
+reddit_dt <- as.data.frame(as.matrix(reddit_mat))
+reddit_dt <- rownames_to_column(reddit_dt)
+reddit_dt <- gather(reddit_dt, rowname2, shared.auth, -rowname)
+reddit_dt$rowname <- factor(reddit_dt$rowname, levels = levels(m_dt$subreddit))
+reddit_dt$rowname2 <- factor(reddit_dt$rowname2, levels = levels(m_dt$subreddit))
+reddit_dt$row1.auth <- m_dt$sum.auth[match(reddit_dt$rowname, m_dt$subreddit)]
+reddit_dt$row2.auth <- m_dt$sum.auth[match(reddit_dt$rowname2, m_dt$subreddit)]
+reddit_dt$tot1.auth <- m_dt$tot.auth[match(reddit_dt$rowname, m_dt$subreddit)]
+reddit_dt$tot2.auth <- m_dt$tot.auth[match(reddit_dt$rowname2, m_dt$subreddit)]
+
+pre_reddit <- reddit_dt %>% 
+  filter(shared.auth > 0) %>%
+  mutate(lrow1 = log(row1.auth), 
+         lrow2 = log(row2.auth)) %>% 
+  select(shared.auth, lrow1, lrow2)
+
+set.seed(-digamma(1))
+svmreddit <- train(shared.auth ~ .,
+                   data = pre_reddit,
+                   preProcess = c("center","scale"),
+                   method = 'svmRadial',
+                   trControl = trainControl(method = "cv", number = 4),
+                   tuneGrid = expand.grid(C=c(100,150,200), sigma=c(3,5,8)))
+
+#checking if transformations perform better
+trans_param <- sapply(reddit_dt %>% 
+         select(shared.auth, row1.auth, row2.auth) %>% 
+         filter(shared.auth > 0), BoxCoxTrans)
+
+pre_reddit_log <- reddit_dt %>% 
+  filter(shared.auth > 0) %>%
+  mutate(lauth = log(shared.auth), 
+         lrow1 = log(row1.auth), 
+         lrow2 = log(row2.auth)) %>% 
+  select(lauth, lrow1, lrow2)
+
+svmreddit_log <- train(lauth ~ .,
+                   data = pre_reddit_log,
+                   preProcess = c("center","scale"),
+                   method = 'svmRadial',
+                   trControl = trainControl(method = "cv", number = 4),
+                   tuneGrid = expand.grid(C=c(1,2,3), sigma=c(1,2,3)))
+
+fi <- predict(svmreddit_log, pre_reddit_log %>% select(-lauth))
+
+ss_res <- sum((reddit_dt[reddit_dt$shared.auth > 0,'shared.auth'] - exp(fi))^2)
+ss_tot <- sum((reddit_dt[reddit_dt$shared.auth > 0,'shared.auth'] 
+               - mean(reddit_dt[reddit_dt$shared.auth > 0,'shared.auth']))^2)
+r_square <- 1 - ss_res/ss_tot
+
+#predicting standard deviation
+y_hat <- predict(svmreddit, pre_reddit %>% select(-shared.auth))
+errors <- abs(pre_reddit$shared.auth - y_hat)
+#rlm weighs down outliers in a linear regression model
+#using log y_hat to get positive ratio data
+lm_er <- rlm(e.sq ~ I(log(y_hat))+ I(log(y_hat)^2), 
+             data.frame(e.sq = errors ^ 2, y_hat))
+#lm_er gives us the variance on errors at y_hat
+y_sd <- data.frame(y_sd = sqrt(predict(lm_er, data.frame(y_hat))))
+
+r_name <- reddit_dt %>% 
+  filter(shared.auth > 0) %>% 
+  select(rowname, rowname2, shared.auth)
+n_reddit_dt <- bind_cols(r_name, data.frame(y_hat), y_sd)
+#transform into plnorm to get relative distances
+#sig is a hand picked parameter deciding log standard deviation for distance
+sig <- 4
+n_reddit_dt <- n_reddit_dt %>% 
+  mutate(z = plnorm(shared.auth, meanlog=log(y_hat), sdlog=log(y_sd)),
+         q = qlnorm(z, sdlog=sig),
+         q2 = qlnorm(z, sdlog=sig, lower.tail = FALSE)) %>%
+  select(rowname, rowname2, z, q, q2)
+
+
+n_reddit_net <- graph.data.frame(n_reddit_dt, directed=F)
+
+#normalized mfpt method
+#new_reddit_mat is divided by two because every value is duplicated in the matrix
+n_mfpt_mat <- as_adjacency_matrix(n_reddit_net, attr='q')/2
+n_mfpt_net <- graph_from_adjacency_matrix(n_mfpt_mat, 
+                                          mode=c("directed"), 
+                                          weighted = "q")
+n_mfpt_graph <- DistGraph(n_mfpt_net, 
+                          v=V(n_mfpt_net), 
+                          edge.attr="q",
+                          dist.method=c("mfpt"),
+                          correct.inf=TRUE, 
+                          correct.factor=NA, 
+                          verbose=TRUE)
+
+n_mfpt_ordered_names <- name_orderer(n_mfpt_graph)
+n_mfpt_paths <- apply(head(n_mfpt_ordered_names), 
+                      1, 
+                      function(x) shortest_paths(n_mfpt_net, 
+                                                 x[1], 
+                                                 x[2])$vpath[[1]])
+
+#normalized shortest path method
+n_sp_mat <- as_adjacency_matrix(n_reddit_net, attr='q2')/2
+n_sp_net <- graph_from_adjacency_matrix(n_sp_mat, 
+                                        mode=c("directed"), 
+                                        weighted="q2")
+n_sp_graph <- DistGraph(n_sp_net, 
+                          v=V(n_sp_net), 
+                          edge.attr="q2",
+                          dist.method=c("shortest.paths"),
+                          correct.inf=TRUE, 
+                          correct.factor=-1, 
+                          verbose=TRUE)
+
+n_sp_names <- name_orderer(n_sp_graph)
+n_sp_paths <- apply(head(n_sp_names), 
+                    1, 
+                    function(x) shortest_paths(n_sp_net, 
+                                               x[1], 
+                                               x[2])$vpath[[1]])
+
